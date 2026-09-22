@@ -1,4 +1,7 @@
 import { Suspense, useEffect, useRef, useState } from "react";
+import { SignedIn, SignedOut, SignIn, UserButton, SignOutButton, useUser } from "@clerk/clerk-react";
+import { dark } from "@clerk/themes";
+import { BlackBoxTimeline, type BlackBoxBlock } from './components/BlackBoxTimeline';
 import {
   Canvas,
   useFrame,
@@ -52,6 +55,8 @@ type BackendPayload = {
   candidates?: Candidate[];
   selectedCandidate?: string;
   eventId?: string;
+  blackBoxChain?: BlackBoxBlock[];
+  isChainValid?: boolean;
 };
 
 const FAULTS: Record<
@@ -116,7 +121,8 @@ function getTelemetry(theta: number) {
 
 function subscribeToBackend(
   onMessage: (payload: BackendPayload) => void,
-  onConnection: (connected: boolean) => void
+  onConnection: (connected: boolean) => void,
+  userId: string
 ) {
   const eventHandler = (event: Event) => {
     const detail = (event as CustomEvent<BackendPayload>).detail;
@@ -127,18 +133,22 @@ function subscribeToBackend(
 
   window.addEventListener("orbitguard:fault", eventHandler);
 
-  const url = import.meta.env.VITE_ORBITGUARD_WS_URL as string | undefined;
+  const baseUrl =
+    (import.meta.env.VITE_ORBITGUARD_WS_URL as string | undefined) ||
+    "ws://127.0.0.1:8000/ws/orbitguard";
+  const websocketUrl = new URL(baseUrl);
+  websocketUrl.searchParams.set("user_id", userId);
 
   let socket: WebSocket | null = null;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   let disposed = false;
 
-  if (url) {
+  if (websocketUrl) {
     const connect = () => {
       if (disposed) return;
 
       try {
-        socket = new WebSocket(url);
+        socket = new WebSocket(websocketUrl.toString());
 
         socket.onopen = () => {
           onConnection(true);
@@ -444,7 +454,8 @@ function OfflineEarthFallback() {
   );
 }
 
-export default function App() {
+function OrbitGuardDashboard() {
+  const { user } = useUser();
   const [theta, setTheta] = useState(0);
   const [showLanding, setShowLanding] = useState(true);
   const [fault, setFault] = useState<FaultType | null>(null);
@@ -462,6 +473,9 @@ export default function App() {
   const [backendCandidates, setBackendCandidates] = useState<Candidate[]>([]);
   const [backendSelectedCandidate, setBackendSelectedCandidate] = useState("");
   const [backendConnected, setBackendConnected] = useState(false);
+  const [blackBoxChain, setBlackBoxChain] = useState<BlackBoxBlock[]>([]);
+  const [isChainValid, setIsChainValid] = useState<boolean>(true);
+  const [isBlackBoxOpen, setIsBlackBoxOpen] = useState(false);
 
   const lastBackendEvent = useRef<string | null>(null);
 
@@ -482,6 +496,13 @@ export default function App() {
      ------------------------------------------------------- */
 
   useEffect(() => {
+    if (!user?.id) {
+      setBlackBoxChain([]);
+      setIsChainValid(true);
+      setBackendConnected(false);
+      return;
+    }
+
     return subscribeToBackend(
       (payload) => {
         // 1. ALWAYS update live position & numerical telemetry
@@ -490,6 +511,11 @@ export default function App() {
             ...previous,
             ...payload.telemetry,
           }));
+        }
+
+        if (payload.blackBoxChain) {
+          setBlackBoxChain(payload.blackBoxChain);
+          setIsChainValid(payload.isChainValid ?? true);
         }
 
         // 2. CALMNESS GUARD:
@@ -551,9 +577,10 @@ export default function App() {
           );
         }
       },
-      setBackendConnected
+      setBackendConnected,
+      user.id
     );
-  }, []);
+  }, [user?.id]);
 
   /* -------------------------------------------------------
      AUTOMATIC PHYSICS ENGINE TRIGGER
@@ -794,6 +821,7 @@ export default function App() {
     setRecovered(false);
     setPlannerOpen(false);
     setProofGateOpen(false);
+    setIsBlackBoxOpen(false);
     setSelectedMethod(null);
     setBackendCandidates([]);
     setBackendSelectedCandidate("");
@@ -804,6 +832,7 @@ export default function App() {
     setRecovered(false);
     setPlannerOpen(false);
     setProofGateOpen(false);
+    setIsBlackBoxOpen(false);
     setSelectedMethod(null);
     setBackendCandidates([]);
     setBackendSelectedCandidate("");
@@ -869,13 +898,37 @@ export default function App() {
           <span className={fault ? "status-dot danger" : "status-dot"} />
           <span>{fault ? "ANOMALY CONTAINED" : "SYSTEM NOMINAL"}</span>
 
+          <span className="backend-status-badge">
+            <i className={backendConnected ? "connection-dot live" : "connection-dot"} />
+            {backendConnected ? "SYSTEM ONLINE" : "BACKEND DISCONNECTED"}
+          </span>
+
           <button className="vault-button" onClick={() => setEvidenceOpen(true)}>
             EVIDENCE VAULT <b>{evidence.length}</b>
+          </button>
+
+          <button className="ledger-button" onClick={() => setIsBlackBoxOpen(true)}>
+            BLACK BOX LEDGER <b>{blackBoxChain.length}</b>
           </button>
 
           <button className="reset-button" onClick={resetMission}>
             RESET MISSION
           </button>
+
+          <SignOutButton>
+            <button className="signout-button">
+              SIGN OUT
+            </button>
+          </SignOutButton>
+
+          <UserButton
+            appearance={{
+              baseTheme: dark,
+              elements: {
+                avatarBox: "clerk-avatar",
+              },
+            }}
+          />
         </div>
       </header>
 
@@ -993,9 +1046,7 @@ export default function App() {
 
           {!fault && (
             <div className="backend-awaiting">
-              <div className="control-description">
-                Awaiting backend telemetry. Fault selection is disabled in the frontend.
-              </div>
+              
 
               <div className="evidence-gate">
                 <div>◌</div>
@@ -1062,6 +1113,7 @@ export default function App() {
               )}
             </div>
           )}
+
         </aside>
       </main>
 
@@ -1418,6 +1470,31 @@ export default function App() {
         </div>
       )}
 
+      {/* BLACK BOX LEDGER MODAL */}
+      {isBlackBoxOpen && (
+        <div className="modal-backdrop">
+          <div className="evidence-modal black-box-modal">
+            <div className="planner-header">
+              <div>
+                <span>ZERO-TRUST AUDIT TRAIL</span>
+                <h2>BLACK BOX FLIGHT LEDGER</h2>
+              </div>
+              <button onClick={() => setIsBlackBoxOpen(false)}>×</button>
+            </div>
+
+            <div className="black-box-modal-content">
+              <p>
+                Every anomaly, candidate evaluation, physics verification and signed uplink frame is cryptographically chained.
+              </p>
+              <BlackBoxTimeline
+                chain={blackBoxChain}
+                isChainValid={isChainValid}
+              />
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* EVIDENCE VAULT MODAL */}
       {evidenceOpen && (
         <div className="modal-backdrop">
@@ -1459,5 +1536,45 @@ export default function App() {
         </div>
       )}
     </div>
+  );
+}
+
+export default function App() {
+  return (
+    <>
+      <SignedIn>
+        <OrbitGuardDashboard />
+      </SignedIn>
+
+      <SignedOut>
+        <div className="auth-gateway">
+          <div className="auth-grid" />
+          <div className="auth-gateway-content">
+            <div className="auth-branding">
+              <span>SECURITY GATEWAY</span>
+              <h1>ORBITGUARD-AI</h1>
+              <p>AUTHENTICATION REQUIRED // ENTER OPERATOR EMAIL FOR OTP CODE</p>
+            </div>
+
+            <SignIn
+              routing="hash"
+              appearance={{
+                baseTheme: dark,
+                elements: {
+                  card: "clerk-sign-in-card",
+                  headerTitle: "clerk-header-title",
+                  headerSubtitle: "clerk-header-subtitle",
+                  formButtonPrimary: "clerk-primary-button",
+                  formFieldInput: "clerk-field-input",
+                  footerActionLink: "clerk-footer-link",
+                },
+              }}
+            />
+
+            <p className="auth-footnote">AIR-GAPPED OPERATOR GATEWAY // SECURED BY CLERK</p>
+          </div>
+        </div>
+      </SignedOut>
+    </>
   );
 }
