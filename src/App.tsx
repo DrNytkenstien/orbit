@@ -57,6 +57,7 @@ type BackendPayload = {
   eventId?: string;
   blackBoxChain?: BlackBoxBlock[];
   isChainValid?: boolean;
+  missionPhase?: string;
 };
 
 const FAULTS: Record<
@@ -122,7 +123,8 @@ function getTelemetry(theta: number) {
 function subscribeToBackend(
   onMessage: (payload: BackendPayload) => void,
   onConnection: (connected: boolean) => void,
-  userId: string
+  userId: string,
+  wsRef: { current: WebSocket | null }
 ) {
   const eventHandler = (event: Event) => {
     const detail = (event as CustomEvent<BackendPayload>).detail;
@@ -149,6 +151,7 @@ function subscribeToBackend(
 
       try {
         socket = new WebSocket(websocketUrl.toString());
+        wsRef.current = socket;
 
         socket.onopen = () => {
           onConnection(true);
@@ -156,7 +159,46 @@ function subscribeToBackend(
 
         socket.onmessage = (message) => {
           try {
-            const payload = JSON.parse(message.data) as BackendPayload;
+            const rawPayload = JSON.parse(message.data) as Omit<BackendPayload, "fault" | "candidates"> & {
+              fault?: FaultType | { title?: string } | null;
+              candidates?: Array<{
+                name?: string;
+                short?: string;
+                color?: string;
+                metrics?: Candidate["metrics"];
+                score?: number;
+                calculations?: string[];
+                explanation?: string;
+                id?: string;
+                title?: string;
+                actions?: string[];
+                steps?: string[];
+                proofs?: string[];
+              }>;
+            };
+            const rawFault = rawPayload.fault;
+            const payload: BackendPayload = {
+              ...rawPayload,
+              fault:
+                rawFault && typeof rawFault === "object"
+                  ? (rawFault.title as FaultType)
+                  : rawFault || null,
+              candidates: rawPayload.candidates?.map((candidate, index) => ({
+                name: candidate.name || candidate.title || `Recovery Candidate ${index + 1}`,
+                short: candidate.short || candidate.title || `Candidate ${index + 1}`,
+                color: candidate.color || (index === 0 ? "#38bdf8" : "#f59e0b"),
+                metrics: candidate.metrics || {
+                  recoveryTime: 0,
+                  resourceUse: 0,
+                  risk: 0,
+                  missionImpact: 0,
+                  constraint: 100,
+                },
+                score: candidate.score || 0,
+                calculations: candidate.calculations || candidate.steps || [],
+                explanation: candidate.explanation || candidate.actions?.join("; ") || "",
+              })),
+            };
             if (payload) {
               onMessage(payload);
             }
@@ -196,6 +238,7 @@ function subscribeToBackend(
     }
 
     socket?.close();
+    wsRef.current = null;
   };
 }
 
@@ -472,10 +515,18 @@ function OrbitGuardDashboard() {
   const [selectedMethod, setSelectedMethod] = useState<Candidate | null>(null);
   const [backendCandidates, setBackendCandidates] = useState<Candidate[]>([]);
   const [backendSelectedCandidate, setBackendSelectedCandidate] = useState("");
+  // Freshest payload from the socket, updated on EVERY tick with no gating.
+  // The Method Graph tab reads its live numbers from here so scores /
+  // recovery times / bars keep moving even while the Recovery Planner modal
+  // is open (backendCandidates itself is intentionally left alone while the
+  // modal is open so the step-by-step calculation reveal doesn't get reset).
+  const [liveTelemetry, setLiveTelemetry] = useState<BackendPayload | null>(null);
   const [backendConnected, setBackendConnected] = useState(false);
   const [blackBoxChain, setBlackBoxChain] = useState<BlackBoxBlock[]>([]);
   const [isChainValid, setIsChainValid] = useState<boolean>(true);
   const [isBlackBoxOpen, setIsBlackBoxOpen] = useState(false);
+  const [missionPhase, setMissionPhase] = useState("NOMINAL ORBIT");
+  const wsRef = useRef<WebSocket | null>(null);
 
   const lastBackendEvent = useRef<string | null>(null);
 
@@ -491,6 +542,26 @@ function OrbitGuardDashboard() {
   const candidates = backendCandidates;
   const activeFault = fault ? FAULTS[fault] : null;
 
+  // Live-merged candidates: same identity/order as `candidates` (so the
+  // Live Calculation stepper stays stable), but score/metrics/etc are
+  // refreshed from the latest WebSocket tick every second. This is what the
+  // Method Graph (tab 02) renders from so it never goes stale while open.
+  const liveCandidates: Candidate[] =
+    candidates.length > 0
+      ? candidates.map((candidate) => {
+          const fresh = liveTelemetry?.candidates?.find(
+            (liveCandidate) => liveCandidate.name === candidate.name
+          );
+          return fresh
+            ? {
+                ...candidate,
+                ...fresh,
+                metrics: { ...candidate.metrics, ...fresh.metrics },
+              }
+            : candidate;
+        })
+      : liveTelemetry?.candidates ?? [];
+
   /* -------------------------------------------------------
      BACKEND STREAMING WITH CALM LOCK
      ------------------------------------------------------- */
@@ -500,11 +571,18 @@ function OrbitGuardDashboard() {
       setBlackBoxChain([]);
       setIsChainValid(true);
       setBackendConnected(false);
+      setMissionPhase("NOMINAL ORBIT");
       return;
     }
 
     return subscribeToBackend(
       (payload) => {
+        // 0. ALWAYS capture the freshest payload, unconditionally, every
+        // tick. This is what the Method Graph tab binds to so its scores,
+        // recovery times and bars keep re-calculating live instead of
+        // freezing at whatever values were on screen when the modal opened.
+        setLiveTelemetry(payload);
+
         // 1. ALWAYS update live position & numerical telemetry
         if (payload.telemetry) {
           setTelemetry((previous) => ({
@@ -516,6 +594,19 @@ function OrbitGuardDashboard() {
         if (payload.blackBoxChain) {
           setBlackBoxChain(payload.blackBoxChain);
           setIsChainValid(payload.isChainValid ?? true);
+        }
+
+        if (payload.missionPhase) {
+          setMissionPhase(payload.missionPhase);
+        }
+
+        if (!payload.fault) {
+          lastBackendEvent.current = null;
+          setFault(null);
+          setRecovered(false);
+          setBackendCandidates([]);
+          setBackendSelectedCandidate("");
+          setSelectedMethod(null);
         }
 
         // 2. CALMNESS GUARD:
@@ -572,13 +663,14 @@ function OrbitGuardDashboard() {
 
           addEvidence(
             "BACKEND CALCULATION PAYLOAD",
-            `${payload.candidates.length} recovery procedures received with machine-generated calculation steps. Backend selected ${payload.selectedCandidate}.`,
+            `${payload.candidates?.length ?? 0} recovery procedures received with machine-generated calculation steps. Backend selected ${payload.selectedCandidate}.`,
             "ACTIVE"
           );
         }
       },
       setBackendConnected,
-      user.id
+      user.id,
+      wsRef
     );
   }, [user?.id]);
 
@@ -587,7 +679,7 @@ function OrbitGuardDashboard() {
      ------------------------------------------------------- */
 
   useEffect(() => {
-    if (!fault || showLanding || recovered || candidates.length < 2) {
+    if (!fault || showLanding || recovered || (candidates?.length ?? 0) < 2) {
       return;
     }
 
@@ -600,7 +692,7 @@ function OrbitGuardDashboard() {
     }, 250);
 
     return () => clearTimeout(timer);
-  }, [fault, showLanding, recovered, candidates.length]);
+  }, [fault, showLanding, recovered, candidates?.length ?? 0]);
 
   /* -------------------------------------------------------
      ORBIT ANIMATION
@@ -642,7 +734,7 @@ function OrbitGuardDashboard() {
   }
 
   function openPlanner() {
-    if (!fault || candidates.length < 2) return;
+    if (!fault || (candidates?.length ?? 0) < 2) return;
 
     setPlannerOpen(true);
     setPlannerTab("CALCULATION");
@@ -667,7 +759,7 @@ function OrbitGuardDashboard() {
     const current = candidates[calculationMethod];
     if (!current) return;
 
-    if (calculationStep < current.calculations.length) {
+    if (calculationStep < (current.calculations?.length ?? 0)) {
       const timer = setTimeout(() => {
         setCalculationStep((previous) => previous + 1);
       }, 650);
@@ -676,8 +768,8 @@ function OrbitGuardDashboard() {
     }
 
     if (
-      calculationStep >= current.calculations.length &&
-      calculationMethod < candidates.length - 1
+      calculationStep >= (current.calculations?.length ?? 0) &&
+      calculationMethod < (candidates?.length ?? 0) - 1
     ) {
       const timer = setTimeout(() => {
         addEvidence(
@@ -694,8 +786,8 @@ function OrbitGuardDashboard() {
     }
 
     if (
-      calculationStep >= current.calculations.length &&
-      calculationMethod === candidates.length - 1
+      calculationStep >= (current.calculations?.length ?? 0) &&
+      calculationMethod === (candidates?.length ?? 0) - 1
     ) {
       const timer = setTimeout(() => {
         addEvidence(
@@ -749,7 +841,7 @@ function OrbitGuardDashboard() {
 
     const checks = [
       fault !== null,
-      calculationFinished && candidates.length >= 2,
+      calculationFinished && (candidates?.length ?? 0) >= 2,
       candidates.every(
         (candidate) =>
           Number.isFinite(candidate.score) &&
@@ -827,6 +919,13 @@ function OrbitGuardDashboard() {
     setBackendSelectedCandidate("");
   }
 
+  function handleContinueMission() {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: "RESOLVE_ANOMALY" }));
+    }
+    continueMission();
+  }
+
   function resetMission() {
     setFault(null);
     setRecovered(false);
@@ -840,6 +939,13 @@ function OrbitGuardDashboard() {
     setShowLanding(true);
     setTheta(0);
     lastBackendEvent.current = null;
+  }
+
+  function handleResetMission() {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: "RESET_MISSION" }));
+    }
+    resetMission();
   }
 
   if (showLanding) {
@@ -904,14 +1010,14 @@ function OrbitGuardDashboard() {
           </span>
 
           <button className="vault-button" onClick={() => setEvidenceOpen(true)}>
-            EVIDENCE VAULT <b>{evidence.length}</b>
+            EVIDENCE VAULT <b>{evidence?.length ?? 0}</b>
           </button>
 
           <button className="ledger-button" onClick={() => setIsBlackBoxOpen(true)}>
-            BLACK BOX LEDGER <b>{blackBoxChain.length}</b>
+            BLACK BOX LEDGER <b>{blackBoxChain?.length ?? 0}</b>
           </button>
 
-          <button className="reset-button" onClick={resetMission}>
+          <button className="reset-button" onClick={handleResetMission}>
             RESET MISSION
           </button>
 
@@ -1044,31 +1150,7 @@ function OrbitGuardDashboard() {
         <aside className="right-panel">
           <div className="panel-title">ANOMALY CONTROL</div>
 
-          {!fault && (
-            <div className="backend-awaiting">
-              
-
-              <div className="evidence-gate">
-                <div>◌</div>
-                <div>
-                  <b>BACKEND FAULT MONITOR</b>
-                  <span>
-                    When a fault is detected, the spacecraft is automatically contained and the Recovery Planner opens.
-                  </span>
-                </div>
-              </div>
-
-              <div className="backend-stream-status">
-                <span className="stream-pulse" />
-                <div>
-                  <b>AGENT STREAM ARMED</b>
-                  <small>Detection → containment → physics → proof → recovery</small>
-                </div>
-              </div>
-            </div>
-          )}
-
-          {fault && activeFault && (
+          {fault && !recovered && activeFault ? (
             <div className="active-anomaly">
               <div className="active-anomaly-header" style={{ borderColor: activeFault.color }}>
                 <div>
@@ -1082,35 +1164,86 @@ function OrbitGuardDashboard() {
 
               <p>{activeFault.description}</p>
 
-              {!recovered ? (
-                <>
-                  <div className="gate-box">
-                    <div className="gate-icon">!</div>
+              <div className="candidate-grid sidebar-candidate-grid">
+                {candidates.map((candidate, index) => (
+                  <div className="candidate-card" key={candidate.name || index}>
+                    <div className="candidate-accent" style={{ background: candidate.color }} />
                     <div>
-                      <b>COMMAND BLOCKED</b>
-                      <span>Recovery requires evidence validation.</span>
+                      <small>{index === 0 ? "SELECTED CANDIDATE" : "ALTERNATIVE"}</small>
+                      <h3>{candidate.name}</h3>
+                      <span>CONFIDENCE: {candidate.score}%</span>
                     </div>
                   </div>
+                ))}
+              </div>
 
-                  <button className="planner-button" onClick={openPlanner}>
-                    OPEN RECOVERY PLANNER <span>→</span>
-                  </button>
-                </>
-              ) : (
-                <>
-                  <div className="verified-box">
-                    <div>✓</div>
-                    <span>
-                      <b>RECOVERY VERIFIED</b>
-                      <small>Telemetry is back inside the safe envelope.</small>
-                    </span>
-                  </div>
+              <div className="gate-box">
+                <div className="gate-icon">!</div>
+                <div>
+                  <b>COMMAND BLOCKED</b>
+                  <span>Recovery requires evidence validation.</span>
+                </div>
+              </div>
 
-                  <button className="continue-button" onClick={continueMission}>
-                    CONTINUE MISSION →
-                  </button>
-                </>
+              <button className="planner-button" onClick={openPlanner}>
+                OPEN RECOVERY PLANNER <span>→</span>
+              </button>
+            </div>
+          ) : recovered || missionPhase === "RECOVERY VERIFIED" ? (
+            <div className="active-anomaly recovery-sidebar-state">
+              <div className="active-anomaly-header" style={{ borderColor: "#34d399" }}>
+                <div>
+                  <small>RECOVERY VERIFIED</small>
+                  <h2>MISSION CONTAINED</h2>
+                </div>
+                <span className="severity-pill" style={{ color: "#34d399" }}>
+                  CONTAINED
+                </span>
+              </div>
+
+              <div className="verified-box">
+                <div>✓</div>
+                <span>
+                  <b>ACTIVE MITIGATION</b>
+                  <small>Autonomous recovery plan executed and telemetry restored.</small>
+                </span>
+              </div>
+
+              <div className="evidence-gate">
+                <div>✓</div>
+                <div>
+                  <b>ZERO-TRUST EVIDENCE COMMITTED</b>
+                  <span>State transition verified in the Black Box Ledger.</span>
+                </div>
+              </div>
+
+              {fault && (
+                <button className="continue-button" onClick={handleContinueMission}>
+                  CONTINUE MISSION →
+                </button>
               )}
+            </div>
+          ) : (
+            <div className="backend-awaiting">
+              <div className="control-description">
+                Awaiting telemetry stream. Anomaly containment armed.
+              </div>
+
+              <div className="evidence-gate">
+                <div>◌</div>
+                <div>
+                  <b>BACKEND FAULT MONITOR</b>
+                  <span>Real-time threshold monitoring active across NASA channel telemetry.</span>
+                </div>
+              </div>
+
+              <div className="backend-stream-status">
+                <span className="stream-pulse" />
+                <div>
+                  <b>AGENT STREAM ARMED</b>
+                  <small>Detection → containment → physics → proof → recovery</small>
+                </div>
+              </div>
             </div>
           )}
 
@@ -1166,10 +1299,10 @@ function OrbitGuardDashboard() {
                             ((calculationMethod +
                               calculationStep /
                                 Math.max(
-                                  candidates[calculationMethod]?.calculations.length || 1,
+                                  candidates[calculationMethod]?.calculations?.length ?? 0,
                                   1
                                 )) /
-                              Math.max(candidates.length, 1)) *
+                              Math.max(candidates?.length ?? 0, 1)) *
                             100
                           }%`,
                     }}
@@ -1177,7 +1310,7 @@ function OrbitGuardDashboard() {
                 </div>
 
                 <div className="method-running">
-                  METHOD {calculationMethod + 1} OF {candidates.length}
+                  METHOD {calculationMethod + 1} OF {candidates?.length ?? 0}
                 </div>
 
                 <div className="candidate-grid">
@@ -1235,9 +1368,9 @@ function OrbitGuardDashboard() {
 
                     <div className="calculating-text">
                       {calculationStep <
-                      (candidates[calculationMethod]?.calculations.length || 0)
+                      (candidates[calculationMethod]?.calculations?.length ?? 0)
                         ? "STREAMING BACKEND EVIDENCE..."
-                        : calculationMethod < candidates.length - 1
+                        : calculationMethod < (candidates?.length ?? 0) - 1
                         ? "METHOD COMPLETE — LOADING NEXT METHOD"
                         : "ALL METHODS CALCULATED"}
                     </div>
@@ -1269,7 +1402,7 @@ function OrbitGuardDashboard() {
                 </div>
 
                 <div className="graph-card">
-                  {candidates.map((candidate) => (
+                  {liveCandidates.map((candidate) => (
                     <div className="graph-row" key={candidate.name}>
                       <div className="graph-label">
                         <span style={{ color: candidate.color }}>●</span>
@@ -1283,17 +1416,18 @@ function OrbitGuardDashboard() {
                             width: `${candidate.score}%`,
                             background: candidate.color,
                             boxShadow: `0 0 18px ${candidate.color}66`,
+                            transition: "width 0.6s ease-out",
                           }}
                         />
                       </div>
 
-                      <strong>{candidate.score}</strong>
+                      <strong>{candidate.score.toFixed(1)}</strong>
                     </div>
                   ))}
                 </div>
 
                 <div className="metric-grid">
-                  {candidates.map((candidate) => (
+                  {liveCandidates.map((candidate) => (
                     <div className="metric-card" key={candidate.name}>
                       <h4>{candidate.short}</h4>
                       <div>
@@ -1512,7 +1646,7 @@ function OrbitGuardDashboard() {
             </div>
 
             <div className="evidence-list">
-              {evidence.length === 0 ? (
+              {(evidence?.length ?? 0) === 0 ? (
                 <div className="empty-evidence">NO EVIDENCE RECORDED</div>
               ) : (
                 evidence.map((item) => (
